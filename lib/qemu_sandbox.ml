@@ -48,17 +48,10 @@ let get_free_port () =
   | ADDR_INET (_, n) -> string_of_int n
   | ADDR_UNIX _ -> assert false;;
 
-let run ~cancelled ?stdin ~log t config result_tmp =
-  let pp f = Os.pp_cmd f ("", config.Config.argv) in
-
+let run_qemu ~pp (config : Config.t) (t : t) ~port result_tmp stdin =
   let extra_mounts = List.map (fun { Config.Mount.src; _ } ->
     ["-drive"; "file=" ^ src / "rootfs" / "image.qcow2" ^ ",if=virtio"]
-  ) config.Config.mounts |> List.flatten in
-
-  Os.with_pipe_to_child @@ fun ~r:qemu_r ~w:qemu_w ->
-  let qemu_stdin = `FD_move_safely qemu_r in
-  let qemu_monitor = Lwt_io.(of_fd ~mode:output) qemu_w in
-  let port = get_free_port () in
+  ) config.mounts |> List.flatten in
   let qemu_binary = match t.qemu_guest_arch with
     | Amd64 -> [ "qemu-system-x86_64"; "-machine"; "accel=kvm,type=pc"; "-cpu"; "host"; "-display"; "none";
                  "-device"; "virtio-net,netdev=net0" ]
@@ -77,33 +70,61 @@ let run ~cancelled ?stdin ~log t config result_tmp =
               "-netdev"; "user,id=net0," ^ network ^ "hostfwd=tcp::" ^ port ^ "-:22";
               "-drive"; "file=" ^ result_tmp / "rootfs" / "image.qcow2" ^ ",if=virtio" ]
               @ extra_mounts in
-  let _, proc = Os.open_process ~stdin:qemu_stdin ~stdout:`Dev_null ~pp cmd in
+  let _, proc = Os.open_process ~stdin ~stdout:`Dev_null ~pp cmd in
+  proc
 
+let wait_for_connection ~pp ssh () =
+  Os.exec_result ~pp (ssh @ ["exit"])
+  |> Lwt_result.map_error (fun _ -> `Retry ())
+
+let retry_n_times n f =
+  Lwt_retry.(f |> on_error |> with_sleep ~duration:(fun _ -> 1.0) |> n_times n)
+
+let mount_dev ssh i dst = function
+  | Linux ->
+    let dev = Printf.sprintf "/dev/vd%c1" (Char.chr (Char.code 'b' + i)) in
+    Os.exec (ssh @ ["sudo"; "mount"; dev; dst])
+  | OpenBSD ->
+    let dev = Printf.sprintf "/dev/sd%ca" (Char.chr (Char.code '1' + i)) in
+    Os.exec (ssh @ ["doas"; "fsck"; "-y"; dev]) >>= fun () ->
+    Os.exec (ssh @ ["doas"; "mount"; dev; dst])
+  | Windows ->
+    Os.exec (ssh @ ["cmd"; "/c"; "rmdir /s /q '" ^ dst ^ "'"]) >>= fun () ->
+    let drive_letter = String.init 1 (fun _ -> Char.chr (Char.code 'd' + i)) in
+    Os.exec (ssh @ ["cmd"; "/c"; "mklink /j '" ^ dst ^ "' '" ^ drive_letter ^ ":\\'"])
+
+let shutdown ssh qemu_monitor = function
+    | Amd64 ->
+      Log.info (fun f -> f "Sending QEMU an ACPI shutdown event");
+      Lwt_io.write qemu_monitor "system_powerdown\n"
+    | Riscv64 ->
+      (* QEMU RISCV does not support ACPI until >= v9 *)
+      Log.info (fun f -> f "Shutting down the VM");
+      Os.exec (ssh @ ["sudo"; "poweroff"])
+
+let wait_for_proc_to_wake proc () =
+  if Lwt.is_sleeping proc then
+    Lwt.return_error (`Retry ())
+  else
+    Lwt.return_ok ()
+
+let run ~cancelled ?stdin ~log t config result_tmp =
+  let pp f = Os.pp_cmd f ("", config.Config.argv) in
+
+  Os.with_pipe_to_child @@ fun ~r:qemu_r ~w:qemu_w ->
+  let qemu_stdin = `FD_move_safely qemu_r in
+  let qemu_monitor = Lwt_io.(of_fd ~mode:output) qemu_w in
+  let port = get_free_port () in
   let ssh = ["ssh"; "opam@localhost"; "-p"; port; "-o"; "NoHostAuthenticationForLocalhost=yes"] in
+  let proc = run_qemu ~pp ~port config t result_tmp qemu_stdin in
 
-  let rec loop = function
-    | 0 -> Lwt_result.fail (`Msg "No connection")
-    | n ->
-      Os.exec_result ~pp (ssh @ ["exit"]) >>= function
-      | Ok _ -> Lwt_result.ok (Lwt.return ())
-      | _ -> Lwt_unix.sleep 1. >>= fun _ -> loop (n - 1) in
   Lwt_unix.sleep 5. >>= fun _ ->
-  loop t.qemu_boot_time >>= fun _ ->
+  retry_n_times t.qemu_boot_time (wait_for_connection ~pp ssh)
+  >>= fun _ ->
 
-  Lwt_list.iteri_s (fun i { Config.Mount.dst; _ } ->
-    match t.qemu_guest_os with
-    | Linux ->
-      let dev = Printf.sprintf "/dev/vd%c1" (Char.chr (Char.code 'b' + i)) in
-      Os.exec (ssh @ ["sudo"; "mount"; dev; dst])
-    | OpenBSD ->
-      let dev = Printf.sprintf "/dev/sd%ca" (Char.chr (Char.code '1' + i)) in
-      Os.exec (ssh @ ["doas"; "fsck"; "-y"; dev]) >>= fun () ->
-      Os.exec (ssh @ ["doas"; "mount"; dev; dst])
-    | Windows ->
-      Os.exec (ssh @ ["cmd"; "/c"; "rmdir /s /q '" ^ dst ^ "'"]) >>= fun () ->
-      let drive_letter = String.init 1 (fun _ -> Char.chr (Char.code 'd' + i)) in
-      Os.exec (ssh @ ["cmd"; "/c"; "mklink /j '" ^ dst ^ "' '" ^ drive_letter ^ ":\\'"])
-  ) config.Config.mounts >>= fun () ->
+  Lwt_list.iteri_s (fun i { Config.Mount.dst; _ } -> mount_dev ssh i dst t.qemu_guest_os)
+    config.Config.mounts
+  >>= fun () ->
 
   Os.with_pipe_from_child @@ fun ~r:out_r ~w:out_w ->
   let stdin = Option.map (fun x -> `FD_move_safely x) stdin in
@@ -124,25 +145,11 @@ let run ~cancelled ?stdin ~log t config result_tmp =
   Os.process_result ~pp proc2 >>= fun res ->
   copy_log >>= fun () ->
 
-  (match t.qemu_guest_arch with
-    | Amd64 ->
-      Log.info (fun f -> f "Sending QEMU an ACPI shutdown event");
-      Lwt_io.write qemu_monitor "system_powerdown\n"
-    | Riscv64 ->
-      (* QEMU RISCV does not support ACPI until >= v9 *)
-      Log.info (fun f -> f "Shutting down the VM");
-      Os.exec (ssh @ ["sudo"; "poweroff"])) >>= fun () ->
-  let rec loop = function
-  | 0 ->
-    Log.warn (fun f -> f "Powering off QEMU");
-    Lwt_io.write qemu_monitor "quit\n"
-  | n ->
-    if Lwt.is_sleeping proc then 
-      Lwt_unix.sleep 1. >>= fun () ->
-      loop (n - 1)
-    else Lwt.return () in
-  loop t.qemu_boot_time >>= fun _ ->
-  
+  shutdown ssh qemu_monitor t.qemu_guest_arch >>= fun () ->
+  retry_n_times t.qemu_boot_time (wait_for_proc_to_wake proc) >>= fun _ ->
+  Log.warn (fun f -> f "Powering off QEMU");
+  Lwt_io.write qemu_monitor "quit\n" >>= fun () ->
+
   Os.process_result ~pp proc >>= fun _ ->
 
   if Lwt.is_sleeping cancelled then Lwt.return (res :> (unit, [`Msg of string | `Cancelled]) result)
